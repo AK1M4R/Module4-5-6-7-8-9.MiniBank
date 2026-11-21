@@ -1,94 +1,135 @@
 package com.minibank;
 
 import java.math.BigDecimal;
+import java.sql.*;
 import java.time.LocalDateTime;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.ArrayList;
+import java.util.List;
 
-/**
- * MiniBank — "MVP", который наспех собрал предыдущий разработчик:
- * вся логика в одном классе, все данные — в HashMap, персистентности
- * нет вообще (перезапуск процесса — и всё пропало).
- *
- * ПРОБЛЕМА (найдёшь и исправишь, когда дойдёт очередь — модуль 7.1,
- * когда появится @Transactional): в transfer() проверка существования
- * счёта-получателя происходит ПОСЛЕ списания денег со счёта-
- * отправителя. Если счёт-получатель не существует, деньги уже спишутся
- * с первого счёта и "исчезнут" — их некуда вернуть, потому что метод
- * прерывается исключением до зачисления.
- *
- * Эта проблема не решается на HashMap "в лоб" без искусственных
- * костылей (можно вручную откатывать баланс в catch, но это не
- * настоящее решение) — она по-настоящему решается только когда
- * появится транзакционность (сначала в БД — ACID, модуль 4, а затем
- * в коде — @Transactional, модуль 7.1). До этого момента баг просто
- * существует и это нормально: то, что появится в модуле 7.1, — как
- * раз тот инструмент, который проблему полностью закрывает.
- */
 public class BankService {
 
-    private final Map<Long, Client> clients = new HashMap<>();
-    private final Map<Long, Account> accounts = new HashMap<>();
-    private final Map<Long, Transaction> transactions = new HashMap<>();
-
-    private final AtomicLong clientIdSeq = new AtomicLong(1);
-    private final AtomicLong accountIdSeq = new AtomicLong(1);
-    private final AtomicLong transactionIdSeq = new AtomicLong(1);
-
     public Client registerClient(String name, String email) {
-        Long id = clientIdSeq.getAndIncrement();
-        Client client = new Client(id, name, email);
-        clients.put(id, client);
-        return client;
+        String sql = "INSERT INTO clients (name, email) VALUES (?, ?) RETURNING id";
+        try (Connection conn = DatabaseConnector.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, name);
+            pstmt.setString(2, email);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    return new Client(rs.getLong("id"), name, email);
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Error registering client", e);
+        }
+        return null;
     }
 
     public Account openAccount(Long clientId, String accountNumber) {
-        if (!clients.containsKey(clientId)) {
-            throw new IllegalArgumentException("Client not found: " + clientId);
+        String sql = "INSERT INTO accounts (client_id, account_number, balance) VALUES (?, ?, 0) RETURNING id, balance";
+        try (Connection conn = DatabaseConnector.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setLong(1, clientId);
+            pstmt.setString(2, accountNumber);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    return new Account(rs.getLong("id"), clientId, accountNumber, rs.getBigDecimal("balance"));
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Error opening account", e);
         }
-        Long id = accountIdSeq.getAndIncrement();
-        Account account = new Account(id, clientId, accountNumber, BigDecimal.ZERO);
-        accounts.put(id, account);
-        return account;
+        return null;
     }
 
     public Account getAccount(Long accountId) {
-        Account account = accounts.get(accountId);
-        if (account == null) {
-            throw new IllegalArgumentException("Account not found: " + accountId);
+        String sql = "SELECT id, client_id, account_number, balance FROM accounts WHERE id = ?";
+        try (Connection conn = DatabaseConnector.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setLong(1, accountId);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    return new Account(
+                            rs.getLong("id"),
+                            rs.getLong("client_id"),
+                            rs.getString("account_number"),
+                            rs.getBigDecimal("balance")
+                    );
+                } else {
+                    throw new IllegalArgumentException("Account not found: " + accountId);
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Error fetching account", e);
         }
-        return account;
     }
 
     public Client getClient(Long clientId) {
-        Client client = clients.get(clientId);
-        if (client == null) {
-            throw new IllegalArgumentException("Client not found: " + clientId);
+        String sql = "SELECT id, name, email FROM clients WHERE id = ?";
+        try (Connection conn = DatabaseConnector.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setLong(1, clientId);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    return new Client(rs.getLong("id"), rs.getString("name"), rs.getString("email"));
+                } else {
+                    throw new IllegalArgumentException("Client not found: " + clientId);
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Error fetching client", e);
         }
-        return client;
+    }
+    
+    public void deposit(Long accountId, BigDecimal amount) {
+        Account account = getAccount(accountId);
+        updateBalance(accountId, account.getBalance().add(amount));
+        recordTransaction(accountId, amount, "DEPOSIT");
     }
 
+    // ВНИМАНИЕ: Баг
     public void transfer(Long fromAccountId, Long toAccountId, BigDecimal amount) {
         Account from = getAccount(fromAccountId);
-
-        // Списываем деньги ДО того, как проверили существование счёта-
-        // получателя — если toAccountId не существует, деньги уже
-        // списаны и потеряны.
+        
         if (from.getBalance().compareTo(amount) < 0) {
             throw new IllegalStateException("Insufficient funds on account " + fromAccountId);
         }
-        from.setBalance(from.getBalance().subtract(amount));
+
+        // 1. Списываем деньги
+        updateBalance(fromAccountId, from.getBalance().subtract(amount));
         recordTransaction(fromAccountId, amount.negate(), "TRANSFER_OUT");
 
-        Account to = getAccount(toAccountId); // если бросит исключение — деньги уже пропали
-
-        to.setBalance(to.getBalance().add(amount));
+        // 2. Проверяем получателя
+        Account to = getAccount(toAccountId); 
+        
+        // 3. Начисляем деньги
+        updateBalance(toAccountId, to.getBalance().add(amount));
         recordTransaction(toAccountId, amount, "TRANSFER_IN");
     }
 
+    private void updateBalance(Long accountId, BigDecimal newBalance) {
+        String sql = "UPDATE accounts SET balance = ? WHERE id = ?";
+        try (Connection conn = DatabaseConnector.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setBigDecimal(1, newBalance);
+            pstmt.setLong(2, accountId);
+            pstmt.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException("Error updating balance", e);
+        }
+    }
+
     private void recordTransaction(Long accountId, BigDecimal amount, String type) {
-        Long id = transactionIdSeq.getAndIncrement();
-        transactions.put(id, new Transaction(id, accountId, amount, type, LocalDateTime.now()));
+        String sql = "INSERT INTO transactions (account_id, amount, type, transaction_date) VALUES (?, ?, ?, ?)";
+        try (Connection conn = DatabaseConnector.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setLong(1, accountId);
+            pstmt.setBigDecimal(2, amount);
+            pstmt.setString(3, type);
+            pstmt.setTimestamp(4, Timestamp.valueOf(LocalDateTime.now()));
+            pstmt.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException("Error recording transaction", e);
+        }
     }
 }
