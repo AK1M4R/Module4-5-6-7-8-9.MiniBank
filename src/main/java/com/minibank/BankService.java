@@ -1,94 +1,159 @@
 package com.minibank;
 
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.EntityTransaction;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.List;
 
-/**
- * MiniBank — "MVP", который наспех собрал предыдущий разработчик:
- * вся логика в одном классе, все данные — в HashMap, персистентности
- * нет вообще (перезапуск процесса — и всё пропало).
- *
- * ПРОБЛЕМА (найдёшь и исправишь, когда дойдёт очередь — модуль 7.1,
- * когда появится @Transactional): в transfer() проверка существования
- * счёта-получателя происходит ПОСЛЕ списания денег со счёта-
- * отправителя. Если счёт-получатель не существует, деньги уже спишутся
- * с первого счёта и "исчезнут" — их некуда вернуть, потому что метод
- * прерывается исключением до зачисления.
- *
- * Эта проблема не решается на HashMap "в лоб" без искусственных
- * костылей (можно вручную откатывать баланс в catch, но это не
- * настоящее решение) — она по-настоящему решается только когда
- * появится транзакционность (сначала в БД — ACID, модуль 4, а затем
- * в коде — @Transactional, модуль 7.1). До этого момента баг просто
- * существует и это нормально: то, что появится в модуле 7.1, — как
- * раз тот инструмент, который проблему полностью закрывает.
- */
 public class BankService {
 
-    private final Map<Long, Client> clients = new HashMap<>();
-    private final Map<Long, Account> accounts = new HashMap<>();
-    private final Map<Long, Transaction> transactions = new HashMap<>();
-
-    private final AtomicLong clientIdSeq = new AtomicLong(1);
-    private final AtomicLong accountIdSeq = new AtomicLong(1);
-    private final AtomicLong transactionIdSeq = new AtomicLong(1);
-
     public Client registerClient(String name, String email) {
-        Long id = clientIdSeq.getAndIncrement();
-        Client client = new Client(id, name, email);
-        clients.put(id, client);
-        return client;
+        EntityManager em = HibernateUtil.getEntityManager();
+        EntityTransaction tx = em.getTransaction();
+        try {
+            tx.begin();
+            // Создаем нового клиента (id сгенерируется автоматически)
+            Client client = new Client(name, email);
+            em.persist(client);
+            tx.commit();
+            return client;
+        } catch (Exception e) {
+            if (tx.isActive()) tx.rollback();
+            throw new RuntimeException("Error registering client", e);
+        } finally {
+            em.close();
+        }
     }
 
     public Account openAccount(Long clientId, String accountNumber) {
-        if (!clients.containsKey(clientId)) {
-            throw new IllegalArgumentException("Client not found: " + clientId);
+        EntityManager em = HibernateUtil.getEntityManager();
+        EntityTransaction tx = em.getTransaction();
+        try {
+            tx.begin();
+            Client client = em.find(Client.class, clientId);
+            if (client == null) {
+                throw new IllegalArgumentException("Client not found: " + clientId);
+            }
+            
+            Account account = new Account(client, accountNumber, BigDecimal.ZERO);
+            em.persist(account);
+            tx.commit();
+            return account;
+        } catch (Exception e) {
+            if (tx.isActive()) tx.rollback();
+            throw new RuntimeException("Error opening account", e);
+        } finally {
+            em.close();
         }
-        Long id = accountIdSeq.getAndIncrement();
-        Account account = new Account(id, clientId, accountNumber, BigDecimal.ZERO);
-        accounts.put(id, account);
-        return account;
     }
 
     public Account getAccount(Long accountId) {
-        Account account = accounts.get(accountId);
-        if (account == null) {
-            throw new IllegalArgumentException("Account not found: " + accountId);
+        EntityManager em = HibernateUtil.getEntityManager();
+        try {
+            Account account = em.find(Account.class, accountId);
+            if (account == null) {
+                throw new IllegalArgumentException("Account not found: " + accountId);
+            }
+            return account;
+        } finally {
+            em.close();
         }
-        return account;
     }
 
     public Client getClient(Long clientId) {
-        Client client = clients.get(clientId);
-        if (client == null) {
-            throw new IllegalArgumentException("Client not found: " + clientId);
+        EntityManager em = HibernateUtil.getEntityManager();
+        try {
+            Client client = em.find(Client.class, clientId);
+            if (client == null) {
+                throw new IllegalArgumentException("Client not found: " + clientId);
+            }
+            return client;
+        } finally {
+            em.close();
         }
-        return client;
+    }
+    
+    public void deposit(Long accountId, BigDecimal amount) {
+        EntityManager em = HibernateUtil.getEntityManager();
+        EntityTransaction tx = em.getTransaction();
+        try {
+            tx.begin();
+            Account account = em.find(Account.class, accountId);
+            if (account == null) throw new IllegalArgumentException("Account not found");
+
+            account.setBalance(account.getBalance().add(amount));
+            
+            Transaction transaction = new Transaction(account, amount, "DEPOSIT", LocalDateTime.now());
+            em.persist(transaction);
+            
+            tx.commit();
+        } catch (Exception e) {
+            if (tx.isActive()) tx.rollback();
+            throw new RuntimeException("Error depositing", e);
+        } finally {
+            em.close();
+        }
     }
 
+    // ВНИМАНИЕ: Баг с исчезновением денег сохранен логически!
     public void transfer(Long fromAccountId, Long toAccountId, BigDecimal amount) {
-        Account from = getAccount(fromAccountId);
+        EntityManager em = HibernateUtil.getEntityManager();
+        EntityTransaction tx = em.getTransaction();
+        try {
+            tx.begin();
+            Account from = em.find(Account.class, fromAccountId);
+            if (from == null) throw new IllegalArgumentException("Account not found: " + fromAccountId);
 
-        // Списываем деньги ДО того, как проверили существование счёта-
-        // получателя — если toAccountId не существует, деньги уже
-        // списаны и потеряны.
-        if (from.getBalance().compareTo(amount) < 0) {
-            throw new IllegalStateException("Insufficient funds on account " + fromAccountId);
+            // Проверка достаточности средств
+            if (from.getBalance().compareTo(amount) < 0) {
+                throw new IllegalStateException("Insufficient funds on account " + fromAccountId);
+            }
+
+            // 1. Списываем деньги
+            from.setBalance(from.getBalance().subtract(amount));
+            Transaction outTx = new Transaction(from, amount.negate(), "TRANSFER_OUT", LocalDateTime.now());
+            em.persist(outTx);
+
+            // 2. Проверяем получателя (выбросит исключение, если не найден)
+            Account to = em.find(Account.class, toAccountId);
+            if (to == null) throw new IllegalArgumentException("Account not found: " + toAccountId);
+
+            // 3. Начисляем деньги
+            to.setBalance(to.getBalance().add(amount));
+            Transaction inTx = new Transaction(to, amount, "TRANSFER_IN", LocalDateTime.now());
+            em.persist(inTx);
+
+            tx.commit();
+        } catch (Exception e) {
+            if (tx.isActive()) tx.rollback(); // В случае ошибки откатываем всё (Hibernate ACID)
+            throw e;
+        } finally {
+            em.close();
         }
-        from.setBalance(from.getBalance().subtract(amount));
-        recordTransaction(fromAccountId, amount.negate(), "TRANSFER_OUT");
-
-        Account to = getAccount(toAccountId); // если бросит исключение — деньги уже пропали
-
-        to.setBalance(to.getBalance().add(amount));
-        recordTransaction(toAccountId, amount, "TRANSFER_IN");
     }
 
-    private void recordTransaction(Long accountId, BigDecimal amount, String type) {
-        Long id = transactionIdSeq.getAndIncrement();
-        transactions.put(id, new Transaction(id, accountId, amount, type, LocalDateTime.now()));
+    // === МЕТОД ДЛЯ ДЕМОНСТРАЦИИ ПРОБЛЕМЫ N+1 ===
+    public List<Client> getAllClientsWithAccounts() {
+        EntityManager em = HibernateUtil.getEntityManager();
+        try {
+            // В этот момент из-за FetchType.EAGER Hibernate сделает кучу запросов
+            return em.createQuery("SELECT c FROM Client c", Client.class).getResultList();
+        } finally {
+            em.close();
+        }
+    }
+    
+    // === ИСПРАВЛЕНИЕ N+1 ===
+    public List<Client> getAllClientsWithAccountsFixed() {
+        // Используем EntityManager
+        var em = HibernateUtil.getEntityManager();
+        try {
+            // LEFT JOIN FETCH заставляет БД сделать JOIN и вернуть клиентов со счетами ОДНИМ запросом
+            String hql = "SELECT DISTINCT c FROM Client c LEFT JOIN FETCH c.accounts";
+            return em.createQuery(hql, Client.class).getResultList();
+        } finally {
+            em.close();
+        }
     }
 }

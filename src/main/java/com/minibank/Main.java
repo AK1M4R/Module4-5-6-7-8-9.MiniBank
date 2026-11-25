@@ -7,15 +7,14 @@ public class Main {
     public static void main(String[] args) {
         BankService bank = new BankService();
 
-        Client client = bank.registerClient("Ivan Petrov", "ivan@example.com");
+        // Генерируем уникальный email при каждом запуске
+        String uniqueEmail = "ivan_" + System.currentTimeMillis() + "@example.com";
+        Client client = bank.registerClient("Ivan Petrov", uniqueEmail);
         Account account1 = bank.openAccount(client.getId(), "ACC-001");
         Account account2 = bank.openAccount(client.getId(), "ACC-002");
 
-        // Пополняем account1 "вручную" переводом с самого себя не получится —
-        // для демо просто задаём баланс напрямую через первый перевод
-        // от несуществующего служебного счёта нет смысла эмулировать,
-        // поэтому просто выставим баланс через пакетный доступ в демо:
-        account1.setBalance(new BigDecimal("1000.00"));
+        // Пополняем account1 через базу данных
+        bank.deposit(account1.getId(), new BigDecimal("1000.00"));
 
         System.out.println("=== Обычный перевод ===");
         bank.transfer(account1.getId(), account2.getId(), new BigDecimal("100.00"));

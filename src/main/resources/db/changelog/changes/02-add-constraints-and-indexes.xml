@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-4.20.xsd">
+    <changeSet id="2" author="student">
+        <!-- UNIQUE на email -->
+        <addUniqueConstraint tableName="clients" columnNames="email" constraintName="uq_clients_email"/>
+
+        <!-- FOREIGN KEYS -->
+        <addForeignKeyConstraint baseTableName="accounts" baseColumnNames="client_id"
+                                 referencedTableName="clients" referencedColumnNames="id"
+                                 constraintName="fk_accounts_client"/>
+        
+        <addForeignKeyConstraint baseTableName="transactions" baseColumnNames="account_id"
+                                 referencedTableName="accounts" referencedColumnNames="id"
+                                 constraintName="fk_transactions_account"/>
+
+        <!-- Индекс под "все транзакции счёта за период" -->
+        <!-- Составной индекс: сначала account_id (поиск по счету), затем transaction_date (фильтрация по времени) -->
+        <createIndex tableName="transactions" indexName="idx_transactions_account_date">
+            <column name="account_id"/>
+            <column name="transaction_date"/>
+        </createIndex>
+    </changeSet>
+</databaseChangeLog>
