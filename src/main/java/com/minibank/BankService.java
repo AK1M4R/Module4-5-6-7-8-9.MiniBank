@@ -1,135 +1,159 @@
 package com.minibank;
 
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.EntityTransaction;
 import java.math.BigDecimal;
-import java.sql.*;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
 import java.util.List;
 
 public class BankService {
 
     public Client registerClient(String name, String email) {
-        String sql = "INSERT INTO clients (name, email) VALUES (?, ?) RETURNING id";
-        try (Connection conn = DatabaseConnector.getConnection();
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setString(1, name);
-            pstmt.setString(2, email);
-            try (ResultSet rs = pstmt.executeQuery()) {
-                if (rs.next()) {
-                    return new Client(rs.getLong("id"), name, email);
-                }
-            }
-        } catch (SQLException e) {
+        EntityManager em = HibernateUtil.getEntityManager();
+        EntityTransaction tx = em.getTransaction();
+        try {
+            tx.begin();
+            // Создаем нового клиента (id сгенерируется автоматически)
+            Client client = new Client(name, email);
+            em.persist(client);
+            tx.commit();
+            return client;
+        } catch (Exception e) {
+            if (tx.isActive()) tx.rollback();
             throw new RuntimeException("Error registering client", e);
+        } finally {
+            em.close();
         }
-        return null;
     }
 
     public Account openAccount(Long clientId, String accountNumber) {
-        String sql = "INSERT INTO accounts (client_id, account_number, balance) VALUES (?, ?, 0) RETURNING id, balance";
-        try (Connection conn = DatabaseConnector.getConnection();
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setLong(1, clientId);
-            pstmt.setString(2, accountNumber);
-            try (ResultSet rs = pstmt.executeQuery()) {
-                if (rs.next()) {
-                    return new Account(rs.getLong("id"), clientId, accountNumber, rs.getBigDecimal("balance"));
-                }
+        EntityManager em = HibernateUtil.getEntityManager();
+        EntityTransaction tx = em.getTransaction();
+        try {
+            tx.begin();
+            Client client = em.find(Client.class, clientId);
+            if (client == null) {
+                throw new IllegalArgumentException("Client not found: " + clientId);
             }
-        } catch (SQLException e) {
+            
+            Account account = new Account(client, accountNumber, BigDecimal.ZERO);
+            em.persist(account);
+            tx.commit();
+            return account;
+        } catch (Exception e) {
+            if (tx.isActive()) tx.rollback();
             throw new RuntimeException("Error opening account", e);
+        } finally {
+            em.close();
         }
-        return null;
     }
 
     public Account getAccount(Long accountId) {
-        String sql = "SELECT id, client_id, account_number, balance FROM accounts WHERE id = ?";
-        try (Connection conn = DatabaseConnector.getConnection();
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setLong(1, accountId);
-            try (ResultSet rs = pstmt.executeQuery()) {
-                if (rs.next()) {
-                    return new Account(
-                            rs.getLong("id"),
-                            rs.getLong("client_id"),
-                            rs.getString("account_number"),
-                            rs.getBigDecimal("balance")
-                    );
-                } else {
-                    throw new IllegalArgumentException("Account not found: " + accountId);
-                }
+        EntityManager em = HibernateUtil.getEntityManager();
+        try {
+            Account account = em.find(Account.class, accountId);
+            if (account == null) {
+                throw new IllegalArgumentException("Account not found: " + accountId);
             }
-        } catch (SQLException e) {
-            throw new RuntimeException("Error fetching account", e);
+            return account;
+        } finally {
+            em.close();
         }
     }
 
     public Client getClient(Long clientId) {
-        String sql = "SELECT id, name, email FROM clients WHERE id = ?";
-        try (Connection conn = DatabaseConnector.getConnection();
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setLong(1, clientId);
-            try (ResultSet rs = pstmt.executeQuery()) {
-                if (rs.next()) {
-                    return new Client(rs.getLong("id"), rs.getString("name"), rs.getString("email"));
-                } else {
-                    throw new IllegalArgumentException("Client not found: " + clientId);
-                }
+        EntityManager em = HibernateUtil.getEntityManager();
+        try {
+            Client client = em.find(Client.class, clientId);
+            if (client == null) {
+                throw new IllegalArgumentException("Client not found: " + clientId);
             }
-        } catch (SQLException e) {
-            throw new RuntimeException("Error fetching client", e);
+            return client;
+        } finally {
+            em.close();
         }
     }
     
     public void deposit(Long accountId, BigDecimal amount) {
-        Account account = getAccount(accountId);
-        updateBalance(accountId, account.getBalance().add(amount));
-        recordTransaction(accountId, amount, "DEPOSIT");
+        EntityManager em = HibernateUtil.getEntityManager();
+        EntityTransaction tx = em.getTransaction();
+        try {
+            tx.begin();
+            Account account = em.find(Account.class, accountId);
+            if (account == null) throw new IllegalArgumentException("Account not found");
+
+            account.setBalance(account.getBalance().add(amount));
+            
+            Transaction transaction = new Transaction(account, amount, "DEPOSIT", LocalDateTime.now());
+            em.persist(transaction);
+            
+            tx.commit();
+        } catch (Exception e) {
+            if (tx.isActive()) tx.rollback();
+            throw new RuntimeException("Error depositing", e);
+        } finally {
+            em.close();
+        }
     }
 
-    // ВНИМАНИЕ: Баг
+    // ВНИМАНИЕ: Баг с исчезновением денег сохранен логически!
     public void transfer(Long fromAccountId, Long toAccountId, BigDecimal amount) {
-        Account from = getAccount(fromAccountId);
-        
-        if (from.getBalance().compareTo(amount) < 0) {
-            throw new IllegalStateException("Insufficient funds on account " + fromAccountId);
+        EntityManager em = HibernateUtil.getEntityManager();
+        EntityTransaction tx = em.getTransaction();
+        try {
+            tx.begin();
+            Account from = em.find(Account.class, fromAccountId);
+            if (from == null) throw new IllegalArgumentException("Account not found: " + fromAccountId);
+
+            // Проверка достаточности средств
+            if (from.getBalance().compareTo(amount) < 0) {
+                throw new IllegalStateException("Insufficient funds on account " + fromAccountId);
+            }
+
+            // 1. Списываем деньги
+            from.setBalance(from.getBalance().subtract(amount));
+            Transaction outTx = new Transaction(from, amount.negate(), "TRANSFER_OUT", LocalDateTime.now());
+            em.persist(outTx);
+
+            // 2. Проверяем получателя (выбросит исключение, если не найден)
+            Account to = em.find(Account.class, toAccountId);
+            if (to == null) throw new IllegalArgumentException("Account not found: " + toAccountId);
+
+            // 3. Начисляем деньги
+            to.setBalance(to.getBalance().add(amount));
+            Transaction inTx = new Transaction(to, amount, "TRANSFER_IN", LocalDateTime.now());
+            em.persist(inTx);
+
+            tx.commit();
+        } catch (Exception e) {
+            if (tx.isActive()) tx.rollback(); // В случае ошибки откатываем всё (Hibernate ACID)
+            throw e;
+        } finally {
+            em.close();
         }
-
-        // 1. Списываем деньги
-        updateBalance(fromAccountId, from.getBalance().subtract(amount));
-        recordTransaction(fromAccountId, amount.negate(), "TRANSFER_OUT");
-
-        // 2. Проверяем получателя
-        Account to = getAccount(toAccountId); 
-        
-        // 3. Начисляем деньги
-        updateBalance(toAccountId, to.getBalance().add(amount));
-        recordTransaction(toAccountId, amount, "TRANSFER_IN");
     }
 
-    private void updateBalance(Long accountId, BigDecimal newBalance) {
-        String sql = "UPDATE accounts SET balance = ? WHERE id = ?";
-        try (Connection conn = DatabaseConnector.getConnection();
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setBigDecimal(1, newBalance);
-            pstmt.setLong(2, accountId);
-            pstmt.executeUpdate();
-        } catch (SQLException e) {
-            throw new RuntimeException("Error updating balance", e);
+    // === МЕТОД ДЛЯ ДЕМОНСТРАЦИИ ПРОБЛЕМЫ N+1 ===
+    public List<Client> getAllClientsWithAccounts() {
+        EntityManager em = HibernateUtil.getEntityManager();
+        try {
+            // В этот момент из-за FetchType.EAGER Hibernate сделает кучу запросов
+            return em.createQuery("SELECT c FROM Client c", Client.class).getResultList();
+        } finally {
+            em.close();
         }
     }
-
-    private void recordTransaction(Long accountId, BigDecimal amount, String type) {
-        String sql = "INSERT INTO transactions (account_id, amount, type, transaction_date) VALUES (?, ?, ?, ?)";
-        try (Connection conn = DatabaseConnector.getConnection();
-             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setLong(1, accountId);
-            pstmt.setBigDecimal(2, amount);
-            pstmt.setString(3, type);
-            pstmt.setTimestamp(4, Timestamp.valueOf(LocalDateTime.now()));
-            pstmt.executeUpdate();
-        } catch (SQLException e) {
-            throw new RuntimeException("Error recording transaction", e);
+    
+    // === ИСПРАВЛЕНИЕ N+1 ===
+    public List<Client> getAllClientsWithAccountsFixed() {
+        // Используем EntityManager
+        var em = HibernateUtil.getEntityManager();
+        try {
+            // LEFT JOIN FETCH заставляет БД сделать JOIN и вернуть клиентов со счетами ОДНИМ запросом
+            String hql = "SELECT DISTINCT c FROM Client c LEFT JOIN FETCH c.accounts";
+            return em.createQuery(hql, Client.class).getResultList();
+        } finally {
+            em.close();
         }
     }
 }
